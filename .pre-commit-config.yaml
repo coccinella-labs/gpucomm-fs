@@ -1,0 +1,28 @@
+default_stages: [pre-commit, pre-push]
+
+repos:
+  - repo: local
+    hooks:
+      - id: forbid-ds-store
+        name: forbid .DS_Store
+        entry: bash -c 'set -euo pipefail; if find . -name .DS_Store -print -quit | grep -q .; then echo ".DS_Store found"; exit 1; fi'
+        language: system
+        pass_filenames: false
+
+      - id: forbid-pem
+        name: forbid *.pem
+        entry: bash -c 'set -euo pipefail; if find . -name "*.pem" -print -quit | grep -q .; then echo "*.pem found"; exit 1; fi'
+        language: system
+        pass_filenames: false
+
+      - id: cargo-fmt-check
+        name: cargo fmt --check (if available)
+        entry: bash -c 'set -euo pipefail; command -v cargo >/dev/null 2>&1 || exit 0; cargo fmt --all -- --check'
+        language: system
+        pass_filenames: false
+
+      - id: cargo-test
+        name: cargo test (if available)
+        entry: bash -c 'set -euo pipefail; command -v cargo >/dev/null 2>&1 || exit 0; cargo test --quiet'
+        language: system
+        pass_filenames: false
