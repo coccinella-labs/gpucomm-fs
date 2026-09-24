@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/Coccinella-Labs/gpucomm-fs/main/.github/assets/thumbnail.png" alt="gpucomm-fs" width="100%">
+  <img src="https://raw.githubusercontent.com/coccinella-labs/gpucomm-fs/main/.github/assets/thumbnail.png" alt="gpucomm-fs" width="100%">
 </p>
 
 # gpucomm-fs
