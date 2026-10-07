@@ -14,17 +14,17 @@ GPUComm-FS requires Rust 1.70+ and is built with `cargo build --release`. The bi
 
 To create a new store, run `cargo run -- init .gpucomm-fs`. This creates the directory structure at `.gpucomm-fs` with subdirectories for objects and metadata. To add a file, run `cargo run -- put .gpucomm-fs path/to/weights.bin --meta kind=weights --meta cuda=12.1`. The command hashes the file, stores it under the content hash, and saves metadata as JSON. To list artifacts in the store, run `cargo run -- ls .gpucomm-fs`. To retrieve a file by its hash, run `cargo run -- get .gpucomm-fs <hash> output.bin`.
 
-Metadata is optional but recommended for discoverability. When adding files, pass `--meta key=value` pairs to tag artifacts with provenance information. Multiple values for the same key can be added by repeating the flag. When listing, the CLI shows all stored artifacts with their hashes and metadata.
+Metadata is optional but recommended for discoverability. When adding files, pass `--meta key=value` pairs to tag artifacts with provenance information. Multiple values for the same key can be added by repeating the flag. When listing, the CLI prints one hash per line.
 
 For development, ensure pre-commit hooks are installed with `pre-commit install` and run them before committing.
 
 ## Architecture
 
-GPUComm-FS uses a simple content-addressed design. Every file is hashed with Blake3, producing a 32-character hex string. Objects are stored at `.gpucomm-fs/objects/<hh>/<hash>`, where `<hh>` is the first two characters of the hash (for filesystem sharding). Metadata is stored separately at `.gpucomm-fs/meta/<hash>.json`, containing user-provided key-value pairs plus computed properties like file size, hash, and addition timestamp.
+GPUComm-FS uses a simple content-addressed design. Every file is hashed with Blake3, producing a 64-character hex string (32 bytes). Objects are stored at `.gpucomm-fs/objects/<hh>/<hash>`, where `<hh>` is the first two characters of the hash (for filesystem sharding). Metadata is stored separately at `.gpucomm-fs/meta/<hash>.json`, containing user-provided key-value pairs plus computed properties like file size, hash, and addition timestamp.
 
 This architecture has several benefits. Deduplication is automatic: if two users add the same file, both hashes compute identically, and the second add is skipped if the object already exists. Integrity verification is built-in: a hash mismatch indicates corruption. Metadata is independent of storage, so you can update tags without re-storing the file. The sharded directory structure (`objects/<hh>/`) prevents filesystem slowdown from too many files in a single directory.
 
-Key code anchors are `src/store.rs` (store initialization and object/metadata management), `src/cli.rs` (command-line interface), and `src/hash.rs` (Blake3 hashing and serialization).
+All code lives in `src/main.rs` (about 170 lines): store initialization, object and metadata management, the CLI, and Blake3 hashing.
 
 ## Data Organization
 
@@ -36,7 +36,7 @@ A typical metadata file looks like this: `{"hash":"abc123...","size":1073741824,
 
 The CLI provides four main commands. `init <store-path>` creates a new store. `put <store-path> <file> [--meta key=value]...` adds a file to the store and returns its hash. `ls <store-path>` lists all artifacts with their hashes and metadata. `get <store-path> <hash> <output-path>` retrieves a file by hash and writes it to the output path. Help is available with `--help` on any command.
 
-The `put` command prints the hash of the added file. Capture this hash for later retrieval: `hash=$(cargo run -- put .gpucomm-fs model.bin --meta kind=weights | tail -1)`. The `ls` command outputs metadata as JSON (with `--format json`) or plain text. The `get` command fails with an error if the hash does not exist in the store.
+The `put` command prints the hash of the added file. Capture this hash for later retrieval: `hash=$(cargo run -- put .gpucomm-fs model.bin --meta kind=weights | tail -1)`. The `ls` command prints one hash per line; there is no `--format` flag and metadata is not shown in listings. The `get` command fails with an error if the hash does not exist in the store.
 
 ## Deduplication and Integrity
 
@@ -56,7 +56,7 @@ When listing with `ls`, metadata is shown alongside the hash. This helps you qui
 
 Fork the repository, create a feature branch, make changes to `src/`, add tests as appropriate, run `pre-commit run --all-files`, and open a PR. Code standards: use `thiserror` and `anyhow` for error handling, keep error messages clear and actionable, and test at least the happy path for new commands.
 
-When adding a new command, implement it in `src/cli.rs` and add a corresponding method in `src/store.rs`. Test locally with `cargo test` and `cargo run -- --help`. If your change affects the store format (object layout, metadata schema), document the compatibility implications.
+When adding a new command, implement it in `src/main.rs` next to the existing command handlers. Test locally with `cargo test` and `cargo run -- --help`. If your change affects the store format (object layout, metadata schema), document the compatibility implications.
 
 ## Build and Test
 
