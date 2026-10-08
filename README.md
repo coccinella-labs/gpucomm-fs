@@ -4,7 +4,7 @@
 
 # GPUComm-FS
 
-GPUComm-FS is a content-addressed artifact store designed for GPU-related binaries and datasets. It provides deduplication, integrity verification, and searchable metadata for large files like model weights, CUDA kernels, datasets, and benchmark bundles. The store uses Blake3 content hashing to ensure binary integrity and enable efficient deduplication across multiple copies of the same file, while a metadata layer allows artifacts to be tagged with properties like CUDA version, framework, or dataset split.
+GPUComm-FS is a content-addressed artifact store designed for GPU-related binaries and datasets. It provides deduplication, verified retrieval, and metadata that accumulates provenance for large files like model weights, CUDA kernels, datasets, and benchmark bundles. The store uses Blake3 content hashing to address objects, enable deduplication across multiple copies of the same file, and verify retrieved bytes, while a metadata layer allows artifacts to be tagged with properties like CUDA version, framework, or dataset split.
 
 Status: v0. Minimal CAS and CLI stable. Future work includes FUSE mounting and higher-level abstractions.
 
@@ -24,13 +24,16 @@ GPUComm-FS uses a simple content-addressed design. Every file is hashed with Bla
 
 This architecture has several benefits. Deduplication is automatic: if two users add the same file, both hashes compute identically, and the second add is skipped if the object already exists. Integrity verification is built-in: a hash mismatch indicates corruption. Metadata is independent of storage, so you can update tags without re-storing the file. The sharded directory structure (`objects/<hh>/`) prevents filesystem slowdown from too many files in a single directory.
 
-All code lives in `src/main.rs` (about 170 lines): store initialization, object and metadata management, the CLI, and Blake3 hashing.
+All code lives in `src/main.rs` (about 280 lines including tests): store initialization, object and metadata management, the CLI, and Blake3 hashing.
 
 ## Data Organization
 
 Objects are stored immutably at `.gpucomm-fs/objects/<hh>/<hash>`. The `<hh>` prefix is the first two characters of the hash, creating up to 256 subdirectories. Each object is the raw binary data of the file; no compression or transformation is applied. Metadata is stored as JSON at `.gpucomm-fs/meta/<hash>.json` with fields for user-provided tags, computed size, timestamp, and the hash itself.
 
-A typical metadata file looks like this: `{"hash":"abc123...","size":1073741824,"created_at":"2026-10-01T12:34:56Z","kind":"weights","framework":"torch","cuda":"12.1"}`. Tags are arbitrary strings; the store does not validate them. When retrieving an artifact, you need only the hash; metadata is fetched separately if needed for discovery.
+A typical metadata file looks like this: `{"hash":"abc123...","size_bytes":1073741824,"meta":{"kind":["weights"],"framework":["torch"],"cuda":["12.1"]}}`. Values are stored as lists, so repeating a key accumulates rather than overwrites:
+`--meta tag=v1 --meta tag=v2` records `"tag": ["v1", "v2"]`. Re-putting the same
+content merges into the existing record instead of discarding earlier keys. Tags are
+arbitrary strings; the store does not validate them. When retrieving an artifact, you need only the hash; metadata is fetched separately if needed for discovery.
 
 ## CLI Usage
 
@@ -40,9 +43,14 @@ The `put` command prints the hash of the added file. Capture this hash for later
 
 ## Deduplication and Integrity
 
-Deduplication works automatically because two identical files always hash to the same value. If you `put` the same file twice, the second operation detects that the hash already exists, skips the copy, and returns the same hash. This saves space when multiple users or projects reference the same dataset or weights file. To verify integrity, compute the hash of a retrieved file and compare it against the stored hash. The CLI does not yet provide a `verify` command, but you can use `blake3` directly: `blake3 output.bin | grep <hash>`.
+Deduplication works automatically because two identical files always hash to the same value. If you `put` the same file twice, the second operation detects that the hash already exists, skips the copy, and returns the same hash. This saves space when multiple users or projects reference the same dataset or weights file. Retrieval is verified automatically: `get` re-hashes the stored object and refuses to
+write output if the bytes do not match the requested hash. There is no separate `verify`
+command, and no repair path; re-put a good copy to fix a corrupted object.
 
-If a file is corrupted on disk, its hash will change, making corruption detectable. The store does not automatically validate hashes on retrieval; you must check the hash manually if you want verification. A future version may add automatic integrity checks and repair strategies.
+If a file is corrupted on disk, its hash changes. `get` re-hashes the stored bytes and
+compares them against the requested hash before writing anything, so a corrupted object
+is refused with a non-zero exit and no output file is produced. Repair is not automated;
+re-put the artifact from a good copy to restore it.
 
 ## Adding Metadata
 

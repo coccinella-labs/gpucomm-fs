@@ -4,7 +4,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Parser, Debug)]
 #[command(name = "gpucomm-fs")]
@@ -39,11 +39,13 @@ enum Command {
     },
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 struct Meta {
     hash: String,
     size_bytes: u64,
-    meta: BTreeMap<String, String>,
+    /// Values are lists so that repeating `--meta key=value` accumulates
+    /// provenance instead of silently discarding earlier values.
+    meta: BTreeMap<String, Vec<String>>,
 }
 
 fn store_layout(store: &Path) -> (PathBuf, PathBuf) {
@@ -55,8 +57,8 @@ fn object_path(objects_dir: &Path, hash: &str) -> PathBuf {
     objects_dir.join(prefix).join(hash)
 }
 
-fn parse_meta(pairs: Vec<String>) -> Result<BTreeMap<String, String>, String> {
-    let mut map = BTreeMap::new();
+fn parse_meta(pairs: Vec<String>) -> Result<BTreeMap<String, Vec<String>>, String> {
+    let mut map: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for pair in pairs {
         let Some((k, v)) = pair.split_once('=') else {
             return Err(format!("invalid --meta '{pair}', expected key=value"));
@@ -64,9 +66,32 @@ fn parse_meta(pairs: Vec<String>) -> Result<BTreeMap<String, String>, String> {
         if k.is_empty() {
             return Err(format!("invalid --meta '{pair}', empty key"));
         }
-        map.insert(k.to_string(), v.to_string());
+        let entry = map.entry(k.to_string()).or_default();
+        if !entry.iter().any(|existing| existing == v) {
+            entry.push(v.to_string());
+        }
     }
     Ok(map)
+}
+
+/// Merge new metadata into whatever is already recorded for an object.
+///
+/// A later `put` of identical content should not drop earlier provenance,
+/// so keys present in both are unioned rather than replaced.
+fn merge_meta(
+    existing: &BTreeMap<String, Vec<String>>,
+    incoming: BTreeMap<String, Vec<String>>,
+) -> BTreeMap<String, Vec<String>> {
+    let mut merged = existing.clone();
+    for (key, values) in incoming {
+        let entry = merged.entry(key).or_default();
+        for value in values {
+            if !entry.iter().any(|existing| existing == &value) {
+                entry.push(value);
+            }
+        }
+    }
+    merged
 }
 
 fn hash_file(path: &Path) -> Result<(String, Vec<u8>), String> {
@@ -132,10 +157,18 @@ fn main() -> Result<(), String> {
 
             let parsed_meta = parse_meta(meta)?;
             let meta_path = meta_dir.join(format!("{hash}.json"));
+
+            let mut merged_meta = BTreeMap::new();
+            if let Ok(existing) = fs::read(&meta_path) {
+                if let Ok(previous) = serde_json::from_slice::<Meta>(&existing) {
+                    merged_meta = previous.meta;
+                }
+            }
+
             let meta_payload = Meta {
                 hash: hash.clone(),
                 size_bytes: bytes.len() as u64,
-                meta: parsed_meta,
+                meta: merge_meta(&merged_meta, parsed_meta),
             };
             let json = serde_json::to_vec_pretty(&meta_payload)
                 .map_err(|e| format!("serialize meta: {e}"))?;
@@ -161,10 +194,93 @@ fn main() -> Result<(), String> {
             }
             let obj_path = object_path(&objects_dir, &hash);
             let bytes = fs::read(&obj_path).map_err(|e| format!("read {obj_path:?}: {e}"))?;
-            fs::write(&out, bytes).map_err(|e| format!("write {out:?}: {e}"))?;
+
+            // Verify before handing anything back. A content-addressed store
+            // that trusts the filename would serve corrupted bytes silently.
+            let actual = blake3::hash(&bytes).to_hex().to_string();
+            if actual != hash {
+                return Err(format!(
+                    "integrity check failed for {hash}: stored object hashes to {actual}"
+                ));
+            }
+
+            fs::write(&out, &bytes).map_err(|e| format!("write {out:?}: {e}"))?;
             println!("wrote {}", out.display());
         }
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn store_in_temp(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("gpucomm-fs-test-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("temp dir");
+        dir.join(".gpucomm-fs")
+    }
+
+    #[test]
+    fn repeated_meta_key_accumulates() {
+        let m = parse_meta(vec!["tag=v1".into(), "tag=v2".into()]).unwrap();
+        assert_eq!(
+            m.get("tag").unwrap(),
+            &vec!["v1".to_string(), "v2".to_string()]
+        );
+    }
+
+    #[test]
+    fn duplicate_meta_value_is_not_repeated() {
+        let m = parse_meta(vec!["tag=v1".into(), "tag=v1".into()]).unwrap();
+        assert_eq!(m.get("tag").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn merge_meta_unions_keys_and_keeps_earlier_ones() {
+        let mut existing = BTreeMap::new();
+        existing.insert("cuda".to_string(), vec!["12.1".to_string()]);
+        let mut incoming = BTreeMap::new();
+        incoming.insert("kind".to_string(), vec!["weights".to_string()]);
+        let merged = merge_meta(&existing, incoming);
+        assert_eq!(merged.get("cuda").unwrap(), &vec!["12.1".to_string()]);
+        assert_eq!(merged.get("kind").unwrap(), &vec!["weights".to_string()]);
+    }
+
+    #[test]
+    fn bad_meta_is_rejected() {
+        assert!(parse_meta(vec!["nokey".into()]).is_err());
+        assert!(parse_meta(vec!["=v".into()]).is_err());
+    }
+
+    #[test]
+    fn hash_is_blake3_and_stable() {
+        let p = std::env::temp_dir().join("gpucomm-fs-hash-probe.bin");
+        fs::write(&p, b"abc").unwrap();
+        let (h1, _) = hash_file(&p).unwrap();
+        let (h2, _) = hash_file(&p).unwrap();
+        assert_eq!(h1, h2);
+        assert_eq!(h1.len(), 64, "blake3 hex is 64 chars");
+        let _ = fs::remove_file(&p);
+    }
+
+    #[test]
+    fn object_path_shards_by_prefix() {
+        let (objects, _) = store_layout(Path::new("/tmp/s"));
+        let p = object_path(&objects, &"ab".repeat(32));
+        assert_eq!(p.file_name().unwrap(), "ab".repeat(32).as_str());
+        assert!(p.parent().unwrap().ends_with("ab"));
+    }
+
+    #[test]
+    fn init_creates_layout() {
+        let store = store_in_temp("init");
+        let (objects, meta) = ensure_store(&store).unwrap();
+        assert!(objects.exists());
+        assert!(meta.exists());
+        let _ = fs::remove_dir_all(store.parent().unwrap());
+    }
 }
