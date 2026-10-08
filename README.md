@@ -24,7 +24,8 @@ GPUComm-FS uses a simple content-addressed design. Every file is hashed with Bla
 
 This architecture has several benefits. Deduplication is automatic: if two users add the same file, both hashes compute identically, and the second add is skipped if the object already exists. Integrity verification is built-in: a hash mismatch indicates corruption. Metadata is independent of storage, so you can update tags without re-storing the file. The sharded directory structure (`objects/<hh>/`) prevents filesystem slowdown from too many files in a single directory.
 
-All code lives in `src/main.rs` (about 280 lines including tests): store initialization, object and metadata management, the CLI, and Blake3 hashing.
+All code lives in `src/main.rs`: store initialization, object and metadata management, the
+CLI, Blake3 hashing, and the verification checks used by both `get` and `verify`.
 
 ## Data Organization
 
@@ -37,15 +38,19 @@ arbitrary strings; the store does not validate them. When retrieving an artifact
 
 ## CLI Usage
 
-The CLI provides four main commands. `init <store-path>` creates a new store. `put <store-path> <file> [--meta key=value]...` adds a file to the store and returns its hash. `ls <store-path>` lists all artifacts with their hashes and metadata. `get <store-path> <hash> <output-path>` retrieves a file by hash and writes it to the output path. Help is available with `--help` on any command.
+The CLI provides five main commands. `init <store-path>` creates a new store. `put <store-path> <file> [--meta key=value]...` adds a file to the store and returns its hash. `ls <store-path>` lists the hash of every stored artifact. `get <store-path> <hash> <output-path>` retrieves a file by hash and writes it to the output path. Help is available with `--help` on any command.
 
-The `put` command prints the hash of the added file. Capture this hash for later retrieval: `hash=$(cargo run -- put .gpucomm-fs model.bin --meta kind=weights | tail -1)`. The `ls` command prints one hash per line; there is no `--format` flag and metadata is not shown in listings. The `get` command fails with an error if the hash does not exist in the store.
+The `put` command prints the hash of the added file. Capture this hash for later retrieval: `hash=$(cargo run -- put .gpucomm-fs model.bin --meta kind=weights | tail -1)`. The `ls` command prints one hash per line; there is no `--format` flag and metadata is not shown in listings. The `get` command fails with an error if the hash does not exist in the store. The `verify`
+command reports `ok <hash>` for each sound object, `FAILED <hash>: <reason>` for each
+problem, a `N checked, M failed` summary, and exits non-zero when `M` is greater than zero.
 
 ## Deduplication and Integrity
 
 Deduplication works automatically because two identical files always hash to the same value. If you `put` the same file twice, the second operation detects that the hash already exists, skips the copy, and returns the same hash. This saves space when multiple users or projects reference the same dataset or weights file. Retrieval is verified automatically: `get` re-hashes the stored object and refuses to
-write output if the bytes do not match the requested hash. There is no separate `verify`
-command, and no repair path; re-put a good copy to fix a corrupted object.
+write output if the bytes do not match the requested hash. To audit a whole store, run
+`verify <store-path>`, which re-hashes every object and cross-checks each metadata
+record, printing one line per object and exiting non-zero if anything failed. Repair is
+not automated; re-put a good copy to fix a corrupted object.
 
 If a file is corrupted on disk, its hash changes. `get` re-hashes the stored bytes and
 compares them against the requested hash before writing anything, so a corrupted object

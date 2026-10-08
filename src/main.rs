@@ -31,6 +31,9 @@ enum Command {
     /// list stored objects (hashes)
     Ls { store: PathBuf },
 
+    /// re-hash every stored object and report corruption
+    Verify { store: PathBuf },
+
     /// retrieve object by hash into output path
     Get {
         store: PathBuf,
@@ -101,6 +104,47 @@ fn hash_file(path: &Path) -> Result<(String, Vec<u8>), String> {
         .map_err(|e| format!("read {path:?}: {e}"))?;
     let hash = blake3::hash(&buf).to_hex().to_string();
     Ok((hash, buf))
+}
+
+/// Re-hash a stored object and confirm it matches the hash it is filed under.
+/// `size` is the byte length recorded in metadata, if available.
+fn verify_object(objects_dir: &Path, meta_dir: &Path, hash: &str) -> Result<(), String> {
+    let obj_path = object_path(objects_dir, hash);
+    let bytes = fs::read(&obj_path).map_err(|e| format!("read {obj_path:?}: {e}"))?;
+
+    let actual = blake3::hash(&bytes).to_hex().to_string();
+    if actual != hash {
+        return Err(format!(
+            "integrity check failed for {hash}: stored object hashes to {actual}"
+        ));
+    }
+
+    // Metadata is written on put, so a size mismatch means the record drifted
+    // from the object it describes.
+    let meta_path = meta_dir.join(format!("{hash}.json"));
+    match fs::read(&meta_path) {
+        Ok(raw) => match serde_json::from_slice::<Meta>(&raw) {
+            Ok(record) => {
+                if record.hash != hash {
+                    return Err(format!(
+                        "metadata {hash}.json records hash {} instead",
+                        record.hash
+                    ));
+                }
+                if record.size_bytes != bytes.len() as u64 {
+                    return Err(format!(
+                        "metadata {hash}.json records size {} but object is {} bytes",
+                        record.size_bytes,
+                        bytes.len()
+                    ));
+                }
+            }
+            Err(e) => return Err(format!("parse {meta_path:?}: {e}")),
+        },
+        Err(_) => return Err(format!("missing metadata for {hash}: {meta_path:?}")),
+    }
+
+    Ok(())
 }
 
 fn ensure_store(store: &Path) -> Result<(PathBuf, PathBuf), String> {
@@ -188,24 +232,45 @@ fn main() -> Result<(), String> {
             }
         }
         Command::Get { store, hash, out } => {
-            let (objects_dir, _) = store_layout(&store);
+            let (objects_dir, meta_dir) = store_layout(&store);
             if hash.len() < 2 {
                 return Err("hash too short".to_string());
             }
-            let obj_path = object_path(&objects_dir, &hash);
-            let bytes = fs::read(&obj_path).map_err(|e| format!("read {obj_path:?}: {e}"))?;
 
             // Verify before handing anything back. A content-addressed store
             // that trusts the filename would serve corrupted bytes silently.
-            let actual = blake3::hash(&bytes).to_hex().to_string();
-            if actual != hash {
-                return Err(format!(
-                    "integrity check failed for {hash}: stored object hashes to {actual}"
-                ));
-            }
+            verify_object(&objects_dir, &meta_dir, &hash)?;
 
+            let obj_path = object_path(&objects_dir, &hash);
+            let bytes = fs::read(&obj_path).map_err(|e| format!("read {obj_path:?}: {e}"))?;
             fs::write(&out, &bytes).map_err(|e| format!("write {out:?}: {e}"))?;
             println!("wrote {}", out.display());
+        }
+        Command::Verify { store } => {
+            let (objects_dir, meta_dir) = store_layout(&store);
+            if !objects_dir.exists() {
+                return Err(format!("no store at {}", store.display()));
+            }
+
+            let hashes = list_hashes(&objects_dir)?;
+            let mut bad = 0usize;
+            for hash in &hashes {
+                match verify_object(&objects_dir, &meta_dir, hash) {
+                    Ok(()) => println!("ok {hash}"),
+                    Err(e) => {
+                        bad += 1;
+                        println!("FAILED {hash}: {e}");
+                    }
+                }
+            }
+
+            println!("{} checked, {bad} failed", hashes.len());
+            if bad > 0 {
+                return Err(format!(
+                    "{bad} of {} objects failed verification",
+                    hashes.len()
+                ));
+            }
         }
     }
 
@@ -282,5 +347,100 @@ mod tests {
         assert!(objects.exists());
         assert!(meta.exists());
         let _ = fs::remove_dir_all(store.parent().unwrap());
+    }
+}
+
+#[cfg(test)]
+mod verify_tests {
+    use super::*;
+
+    struct TempStore(PathBuf);
+
+    impl Drop for TempStore {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(self.0.parent().unwrap());
+        }
+    }
+
+    fn store(name: &str) -> TempStore {
+        let dir = std::env::temp_dir().join(format!("gpucomm-fs-vt-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        TempStore(dir.join(".gpucomm-fs"))
+    }
+
+    fn put(store: &TempStore, bytes: &[u8], meta: &[(&str, &str)]) -> String {
+        let src = store.0.parent().unwrap().join("src.bin");
+        fs::write(&src, bytes).unwrap();
+        let (hash, _) = hash_file(&src).unwrap();
+        let (objects_dir, meta_dir) = ensure_store(&store.0).unwrap();
+        let obj_path = object_path(&objects_dir, &hash);
+        fs::create_dir_all(obj_path.parent().unwrap()).unwrap();
+        fs::write(&obj_path, bytes).unwrap();
+        let parsed = parse_meta(meta.iter().map(|(k, v)| format!("{k}={v}")).collect()).unwrap();
+        let payload = Meta {
+            hash: hash.clone(),
+            size_bytes: bytes.len() as u64,
+            meta: parsed,
+        };
+        fs::write(
+            meta_dir.join(format!("{hash}.json")),
+            serde_json::to_vec_pretty(&payload).unwrap(),
+        )
+        .unwrap();
+        hash
+    }
+
+    #[test]
+    fn clean_object_verifies() {
+        let s = store("clean");
+        let h = put(&s, b"hello world", &[("kind", "weights")]);
+        let (o, m) = ensure_store(&s.0).unwrap();
+        verify_object(&o, &m, &h).expect("clean object must verify");
+    }
+
+    #[test]
+    fn corrupted_object_is_caught() {
+        let s = store("corrupt");
+        let h = put(&s, b"hello world", &[]);
+        let (o, m) = ensure_store(&s.0).unwrap();
+        fs::write(object_path(&o, &h), b"tampered").unwrap();
+        let err = verify_object(&o, &m, &h).unwrap_err();
+        assert!(err.contains("integrity check failed"), "got: {err}");
+    }
+
+    #[test]
+    fn missing_metadata_is_caught() {
+        let s = store("nometa");
+        let h = put(&s, b"payload", &[]);
+        let (o, m) = ensure_store(&s.0).unwrap();
+        fs::remove_file(m.join(format!("{h}.json"))).unwrap();
+        let err = verify_object(&o, &m, &h).unwrap_err();
+        assert!(err.contains("missing metadata"), "got: {err}");
+    }
+
+    #[test]
+    fn size_drift_between_object_and_metadata_is_caught() {
+        let s = store("size");
+        let h = put(&s, b"payload", &[]);
+        let (o, m) = ensure_store(&s.0).unwrap();
+        let meta_path = m.join(format!("{h}.json"));
+        let mut record: Meta = serde_json::from_slice(&fs::read(&meta_path).unwrap()).unwrap();
+        record.size_bytes = 999;
+        fs::write(&meta_path, serde_json::to_vec(&record).unwrap()).unwrap();
+        let err = verify_object(&o, &m, &h).unwrap_err();
+        assert!(err.contains("records size 999"), "got: {err}");
+    }
+
+    #[test]
+    fn single_byte_corruption_is_detected() {
+        let s = store("onebyte");
+        let original: Vec<u8> = (0..=255u8).collect();
+        let h = put(&s, &original, &[]);
+        let (o, m) = ensure_store(&s.0).unwrap();
+        let mut tampered = original.clone();
+        tampered[100] ^= 0x01;
+        fs::write(object_path(&o, &h), &tampered).unwrap();
+        assert!(verify_object(&o, &m, &h).is_err());
     }
 }
