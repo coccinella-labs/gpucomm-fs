@@ -4,103 +4,170 @@
 
 # GPUComm-FS
 
-GPUComm-FS is a content-addressed artifact store designed for GPU-related binaries and datasets. It provides deduplication, verified retrieval, and metadata that accumulates provenance for large files like model weights, CUDA kernels, datasets, and benchmark bundles. The store uses Blake3 content hashing to address objects, enable deduplication across multiple copies of the same file, and verify retrieved bytes, while a metadata layer allows artifacts to be tagged with properties like CUDA version, framework, or dataset split.
+A content-addressed store for GPU artifacts: model weights, kernels, datasets, benchmark bundles.
 
-Status: v0. Minimal CAS and CLI stable. Future work includes FUSE mounting and higher-level abstractions.
+Objects are addressed by their Blake3 hash, so identical files are stored once. Every retrieval
+is verified against the hash it was filed under, and repeated metadata keys accumulate instead of
+overwriting. Written in Rust, roughly 450 lines in a single file, no runtime dependencies.
 
-## Getting Started
+Status: v0.1.0. The store format and CLI are stable. FUSE mounting is not implemented.
 
-GPUComm-FS requires Rust 1.70+ and is built with `cargo build --release`. The binary provides a command-line interface for initializing stores, adding artifacts, and retrieving them by content hash.
+## Do you need this?
 
-To create a new store, run `cargo run -- init .gpucomm-fs`. This creates the directory structure at `.gpucomm-fs` with subdirectories for objects and metadata. To add a file, run `cargo run -- put .gpucomm-fs path/to/weights.bin --meta kind=weights --meta cuda=12.1`. The command hashes the file, stores it under the content hash, and saves metadata as JSON. To list artifacts in the store, run `cargo run -- ls .gpucomm-fs`. To retrieve a file by its hash, run `cargo run -- get .gpucomm-fs <hash> output.bin`.
+**Use it** when you have a few large files that are written once and read many times, you want
+copies of the same weights file to cost nothing extra, and you would rather know a file is
+intact than find out later.
 
-Metadata is optional but recommended for discoverability. When adding files, pass `--meta key=value` pairs to tag artifacts with provenance information. Multiple values for the same key can be added by repeating the flag. When listing, the CLI prints one hash per line.
+**Skip it** for anything else. This is not a filesystem, not a backup tool, and not fast enough
+to be one. Specifically:
 
-For development, ensure pre-commit hooks are installed with `pre-commit install` and run them before committing.
+- No compression. Objects are stored at full size.
+- No cross-store deduplication. Two stores share nothing.
+- No metadata search. `ls` prints hashes only, and you filter yourself.
+- No repair. `verify` detects corruption, nothing rebuilds it.
+- No partial or resumable uploads.
 
-## Architecture
+If you need any of those, use an artifact store built for it.
 
-GPUComm-FS uses a simple content-addressed design. Every file is hashed with Blake3, producing a 64-character hex string (32 bytes). Objects are stored at `.gpucomm-fs/objects/<hh>/<hash>`, where `<hh>` is the first two characters of the hash (for filesystem sharding). Metadata is stored separately at `.gpucomm-fs/meta/<hash>.json`, containing user-provided key-value pairs plus computed properties like file size, hash, and addition timestamp.
+## Quickstart
 
-This architecture has several benefits. Deduplication is automatic: if two users add the same file, both hashes compute identically, and the second add is skipped if the object already exists. Integrity verification is built-in: a hash mismatch indicates corruption. Metadata is independent of storage, so you can update tags without re-storing the file. The sharded directory structure (`objects/<hh>/`) prevents filesystem slowdown from too many files in a single directory.
+```bash
+git clone https://github.com/coccinella-labs/gpucomm-fs
+cd gpucomm-fs
+cargo build --release
+```
 
-All code lives in `src/main.rs`: store initialization, object and metadata management, the
-CLI, Blake3 hashing, and the verification checks used by both `get` and `verify`.
+Initialize a store, then add a file:
 
-## Data Organization
+```bash
+gpucomm-fs init .gpucomm-fs
+hash=$(gpucomm-fs put .gpucomm-fs weights.bin --meta kind=weights --meta cuda=12.1 | tail -1)
+```
 
-Objects are stored immutably at `.gpucomm-fs/objects/<hh>/<hash>`. The `<hh>` prefix is the first two characters of the hash, creating up to 256 subdirectories. Each object is the raw binary data of the file; no compression or transformation is applied. Metadata is stored as JSON at `.gpucomm-fs/meta/<hash>.json` with fields for user-provided tags, computed size, timestamp, and the hash itself.
+Putting the same file twice returns the same hash and writes no second copy:
 
-A typical metadata file looks like this: `{"hash":"abc123...","size_bytes":1073741824,"meta":{"kind":["weights"],"framework":["torch"],"cuda":["12.1"]}}`. Values are stored as lists, so repeating a key accumulates rather than overwrites:
-`--meta tag=v1 --meta tag=v2` records `"tag": ["v1", "v2"]`. Re-putting the same
-content merges into the existing record instead of discarding earlier keys. Tags are
-arbitrary strings; the store does not validate them. When retrieving an artifact, you need only the hash; metadata is fetched separately if needed for discovery.
+```bash
+gpucomm-fs put .gpucomm-fs weights.bin
+gpucomm-fs ls .gpucomm-fs
+```
 
-## CLI Usage
+Retrieve it, then check the whole store:
 
-The CLI provides five main commands. `init <store-path>` creates a new store. `put <store-path> <file> [--meta key=value]...` adds a file to the store and returns its hash. `ls <store-path>` lists the hash of every stored artifact. `get <store-path> <hash> <output-path>` retrieves a file by hash and writes it to the output path. Help is available with `--help` on any command.
+```bash
+gpucomm-fs get .gpucomm-fs "$hash" restored.bin
+gpucomm-fs verify .gpucomm-fs
+```
 
-The `put` command prints the hash of the added file. Capture this hash for later retrieval: `hash=$(cargo run -- put .gpucomm-fs model.bin --meta kind=weights | tail -1)`. The `ls` command prints one hash per line; there is no `--format` flag and metadata is not shown in listings. The `get` command fails with an error if the hash does not exist in the store. The `verify`
-command reports `ok <hash>` for each sound object, `FAILED <hash>: <reason>` for each
-problem, a `N checked, M failed` summary, and exits non-zero when `M` is greater than zero.
+Every command works from `cargo run -- <command>` if you have not built the binary.
 
-## Deduplication and Integrity
+## Commands
 
-Deduplication works automatically because two identical files always hash to the same value. If you `put` the same file twice, the second operation detects that the hash already exists, skips the copy, and returns the same hash. This saves space when multiple users or projects reference the same dataset or weights file. Retrieval is verified automatically: `get` re-hashes the stored object and refuses to
-write output if the bytes do not match the requested hash. To audit a whole store, run
-`verify <store-path>`, which re-hashes every object and cross-checks each metadata
-record, printing one line per object and exiting non-zero if anything failed. Repair is
-not automated; re-put a good copy to fix a corrupted object.
+| Command | Purpose |
+|---|---|
+| `init <store>` | create the store layout |
+| `put <store> <file> [--meta key=value]...` | store a file, print its hash |
+| `ls <store>` | print one hash per line |
+| `get <store> <hash> <out>` | verified retrieval |
+| `verify <store>` | re-hash every object, cross-check metadata |
 
-If a file is corrupted on disk, its hash changes. `get` re-hashes the stored bytes and
-compares them against the requested hash before writing anything, so a corrupted object
-is refused with a non-zero exit and no output file is produced. Repair is not automated;
-re-put the artifact from a good copy to restore it.
+All of them exit non-zero on failure. `get` and `verify` refuse to write output for an object
+that fails verification.
 
-## Adding Metadata
+## How storage works
 
-Metadata is stored in JSON and is independent of the object. When adding a file, pass `--meta key=value` flags to tag it. Multiple tags can be added: `put .gpucomm-fs weights.bin --meta kind=weights --meta framework=torch --meta cuda=12.1 --meta size=large`. All metadata is stored as strings; the store does not parse or validate them.
+```
+.gpucomm-fs/
+  objects/<hh>/<hash>     raw file bytes, 64 hex chars, <hh> is the first two
+  meta/<hash>.json        size, hash, and your metadata
+```
 
-Common metadata keys for GPU artifacts include `kind` (weights, dataset, kernel, benchmark), `framework` (torch, tensorflow, jax), `cuda` (CUDA version), `arch` (GPU architecture like sm_80), and `split` (for datasets, e.g., train/val/test). You can invent custom keys as needed; they are purely for discovery and are not used by the store itself.
+Objects are immutable and untransformed. Two files with identical bytes produce the same hash
+and therefore the same path, so the second `put` is a no-op. Sharding on the first two hex
+characters spreads objects across up to 256 directories instead of one.
 
-When listing with `ls`, metadata is shown alongside the hash. This helps you quickly find the artifact you need without having to retrieve all objects. In the future, a `search` command may allow filtering by metadata.
+Metadata is a separate file, so tags can be added without touching the object. A record looks
+like this:
+
+```json
+{
+  "hash": "8b6351e283842383c54d03811bd9900b68cf0505efff3c6e21756a3e5eb6daf1",
+  "size_bytes": 2048,
+  "meta": { "cuda": ["12.1"], "kind": ["weights"] }
+}
+```
+
+Values are lists by design. `--meta tag=v1 --meta tag=v2` records `["v1", "v2"]`, and re-putting
+the same content merges into the existing record instead of dropping earlier keys. Keys are not
+validated; useful conventions are `kind` (weights, dataset, kernel, benchmark), `framework`,
+`cuda`, `arch` (sm_80), and `split` (train, val, test).
+
+## Integrity
+
+`get` re-hashes the stored bytes and compares them to the requested hash before writing
+anything, so a corrupted object is reported and no output file is produced:
+
+```console
+$ gpucomm-fs get .gpucomm-fs 8b63... out.bin
+Error: "integrity check failed for 8b63...: stored object hashes to ffc3..."
+$ echo $?
+1
+```
+
+`verify` applies the same check to the whole store and also cross-checks each metadata record
+against the object it describes, so a missing sidecar file or a stale `size_bytes` is caught:
+
+```console
+$ gpucomm-fs verify .gpucomm-fs
+ok 83f42badff9e601f7267ef3902940398760fe22a44887d4d05a3f05408bea7ba
+FAILED d5b33ecc...: integrity check failed: stored object hashes to 55d4838...
+2 checked, 1 failed
+```
+
+Recovery is manual. Re-put a good copy of the artifact to restore it.
+
+## Measured performance
+
+One 1 GiB file, one store, on the machine this was last tested on. Absolute numbers are
+disk-dependent; the useful part is the ratio between operations.
+
+| Operation | Time | Effective rate |
+|---|---|---|
+| `put` (hash + write) | 0.89 s | 1.12 GiB/s |
+| `get` (verify + write) | 1.57 s | 0.64 GiB/s |
+| `verify` (re-hash) | 1.06 s | 0.94 GiB/s |
+| `ls` (single object) | 4 ms | n/a |
+
+For reference, `cp` of the same file took 1.19 s on this disk. The store is I/O bound, not
+hash bound, so throughput tracks the underlying disk rather than Blake3.
+
+`ls` walks the object directories, so it grows with the number of objects and stays fast enough
+for stores in the low thousands of files. Metadata is never read by `ls`.
+
+## Development
+
+```bash
+cargo build --release
+cargo test          # unit and README-drift tests, no network required
+cargo fmt --all
+```
+
+Hooks run on commit and push if you have `pre-commit install` set up. They check formatting, run
+the test suite, and refuse `.DS_Store` and `.pem` files.
+
+`tests/readme.rs` asserts that this file stays in step with the code: every command is
+documented, and the known-false claims that previously shipped here cannot come back. It runs as
+part of `cargo test`, so a README that drifts from the implementation fails CI.
 
 ## Contributing
 
-Fork the repository, create a feature branch, make changes to `src/`, add tests as appropriate, run `pre-commit run --all-files`, and open a PR. Code standards: use `thiserror` and `anyhow` for error handling, keep error messages clear and actionable, and test at least the happy path for new commands.
+Open an issue first for anything that changes the store format, since the object layout and
+metadata schema are compatibility surfaces. For changes that do not, a branch and a pull
+request are enough.
 
-When adding a new command, implement it in `src/main.rs` next to the existing command handlers. Test locally with `cargo test` and `cargo run -- --help`. If your change affects the store format (object layout, metadata schema), document the compatibility implications.
-
-## Build and Test
-
-Build with `cargo build --release` or `cargo build` for debug. Run tests with `cargo test --all-features`. Benchmarking the store's performance is not yet automated; for now, measure manually by timing `put` and `get` operations on files of varying sizes.
-
-## Known Limitations
-
-Version 0 provides basic content-addressed storage and metadata tagging but lacks several planned features. FUSE mounting is not yet implemented; future versions will allow treating the store as a filesystem. Compression is not applied; files are stored at full size. Deduplication works only within a single store; multiple stores do not cross-reference shared objects. Metadata is not indexed; `ls` returns all artifacts and must be filtered in memory. Partial file uploads and resumable transfers are not supported. Backup and replication strategies are not built-in.
-
-The store is designed for relatively static artifacts (weights, datasets) rather than frequently-changing files. It works best when used as a stable reference for reproducible experiments, not as a live working directory.
-
-## Performance and Sizing
-
-Hashing speed with Blake3 is around 5-10 GB/s on modern CPUs, so adding large files (> 10 GB) is I/O bound. Storage overhead is minimal: the store adds only the object file plus a small JSON metadata file per artifact. Deduplication is instant (hash lookup is O(1) in the filesystem sharding scheme). Retrieval is simply a file copy and is I/O limited. No in-memory caching is currently used.
-
-For datasets in the 10-100 GB range, expect `put` to take 1-10 seconds and `get` to take a few seconds, depending on disk speed. Metadata operations are fast regardless of file size.
-
-## Roadmap and Future Work
-
-Planned features include FUSE mounting to treat the store as a filesystem, metadata indexing to speed up discovery, compression and deduplication at the block level, and integration with remote storage backends (S3, GCS). A search command to filter artifacts by metadata is planned. Batch operations for adding multiple files at once are under consideration.
-
-See GitHub Issues for the roadmap and to report bugs or request features.
-
-## Related Documentation
-
-The store is designed to integrate with gpucomm benchmarking tools and serves as a foundation for artifact management in GPU compute experiments. See the main gpucomm documentation for context on how artifact management fits into the broader workflow.
+New commands go next to the existing handlers in `src/main.rs`. Errors are returned as
+`Result<_, String>` with a message that names the failing path; there is no error framework in
+use and adding one is a separate decision.
 
 ## License
 
-MIT. See LICENSE file.
-
-## Contact
-
-Questions? Open an issue on GitHub or see the repository for discussion.
+MIT. See [LICENSE](LICENSE).
