@@ -185,6 +185,35 @@ fn documented_layout_matches_implementation() {
     );
 }
 
+/// The package must not describe itself as a filesystem or as format-aware.
+/// It hashes raw bytes and never inspects them, and there is no FUSE layer.
+#[test]
+fn package_metadata_does_not_claim_features_absent() {
+    let source = std::fs::read_to_string(repo_root().join("src/main.rs")).unwrap();
+
+    for (claim, why) in [
+        (
+            "filesystem foundation",
+            "there is no FUSE layer or filesystem abstraction",
+        ),
+        (
+            "binary-aware",
+            "the store hashes raw bytes and never inspects formats",
+        ),
+    ] {
+        assert!(
+            !source.contains(claim),
+            "package metadata claims `{claim}`, which is false: {why}"
+        );
+    }
+
+    // The replacement must be accurate rather than merely different.
+    assert!(
+        source.contains("content-addressed artifact store"),
+        "the about string should describe the store as content-addressed"
+    );
+}
+
 /// Performance numbers must be labelled as measurements, not predictions.
 #[test]
 fn performance_numbers_are_marked_as_measured() {

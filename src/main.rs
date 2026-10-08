@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Parser, Debug)]
 #[command(name = "gpucomm-fs")]
-#[command(about = "binary-aware cas + filesystem foundation", long_about = None)]
+#[command(about = "content-addressed artifact store", long_about = None)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
